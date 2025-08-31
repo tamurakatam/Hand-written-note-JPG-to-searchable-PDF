@@ -1,0 +1,153 @@
+# -*- coding: utf-8 -*-
+"""
+p1.jpg → 検索可能PDF（日本語OK / PyMuPDF 1.26 用）
+- Document AI で OCR（日本語ヒント）
+- フォントは Page.insert_font('japan') を使用（CJK対応フォールバックを自動埋め込み）
+- 透明テキスト: 段落 → 行 → トークンの順で配置（不可視 render_mode=3）
+"""
+
+import os, json, time
+from typing import List, Optional
+import fitz  # PyMuPDF
+from google.cloud import documentai_v1 as documentai
+from google.api_core.client_options import ClientOptions
+from google.api_core.exceptions import PermissionDenied, InvalidArgument, GoogleAPICallError
+
+# ===== 認証 =====
+GOOGLE_APPLICATION_CREDENTIALS = r"C:\Users\Koichi\Downloads\kinetic-horizon-427307-b9-b6a966b09ac0.json"
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GOOGLE_APPLICATION_CREDENTIALS
+
+# ===== 入出力 =====
+INPUT_IMG  = r"C:\Users\Koichi\Documents\p3.jpg"
+OUTPUT_PDF = r"C:\Users\Koichi\Documents\note_ocr.pdf"
+
+# ===== Document AI =====
+PROJECT_ID   = "kinetic-horizon-427307-b9"
+LOCATION     = "us"
+PROCESSOR_ID = "df6a2b825d9f887a"       # 例: 'f7c1234567890abc'
+
+client = documentai.DocumentProcessorServiceClient(
+    client_options=ClientOptions(api_endpoint=f"{LOCATION}-documentai.googleapis.com")
+)
+PROCESSOR_NAME = client.processor_path(PROJECT_ID, LOCATION, PROCESSOR_ID)
+
+# ===== ヘルパー =====
+def extract_text_from_anchor(anchor: Optional[documentai.Document.TextAnchor], full_text: str) -> str:
+    if not anchor or not anchor.text_segments: return ""
+    parts = []
+    for seg in anchor.text_segments:
+        s = int(seg.start_index) if seg.start_index is not None else 0
+        e = int(seg.end_index)
+        parts.append(full_text[s:e])
+    return "".join(parts)
+
+def normalized_poly_to_rect(norm_verts, w: float, h: float) -> Optional[fitz.Rect]:
+    if not norm_verts or len(norm_verts) < 3: return None
+    x0, y0 = norm_verts[0].x * w, norm_verts[0].y * h
+    x2, y2 = norm_verts[2].x * w, norm_verts[2].y * h
+    if x2 <= x0 or y2 <= y0: return None
+    return fitz.Rect(x0, y0, x2, y2)
+
+def replace_with_retry(src: str, dst: str, retries=5, delay=0.5) -> bool:
+    for _ in range(retries):
+        try:
+            os.replace(src, dst); return True
+        except PermissionError:
+            time.sleep(delay)
+    return False
+
+# ===== メイン =====
+def image_to_searchable_pdf(input_img: str, output_pdf: str, print_langs=True):
+    if "ここに_b9_の_ProcessorID" in PROCESSOR_ID:
+        raise RuntimeError("PROCESSOR_ID を実IDに置き換えてください。")
+    if not os.path.exists(input_img):
+        raise FileNotFoundError(f"入力画像が見つかりません: {input_img}")
+
+    with open(input_img, "rb") as f:
+        img_bytes = f.read()
+
+    # 日本語ヒント付き
+    process_options = documentai.ProcessOptions(
+        ocr_config=documentai.OcrConfig(
+            hints=documentai.OcrConfig.Hints(language_hints=["ja","ja-JP","en"]),
+            enable_image_quality_scores=True,
+            compute_style_info=True,
+        )
+    )
+    request = documentai.ProcessRequest(
+        name=PROCESSOR_NAME,
+        raw_document=documentai.RawDocument(content=img_bytes, mime_type="image/jpeg"),
+        process_options=process_options,
+    )
+
+    try:
+        res = client.process_document(request=request)
+    except PermissionDenied:
+        print("[ERROR] PermissionDenied 403 / 権限・課金・endpoint/location を確認"); raise
+    except InvalidArgument:
+        print("[ERROR] InvalidArgument / PROCESSOR_ID or LOCATION を確認"); raise
+    except GoogleAPICallError as e:
+        print("[ERROR] GoogleAPICallError:", e); raise
+
+    doc_ai = res.document
+    full = doc_ai.text or ""
+    if print_langs:
+        for i, p in enumerate(doc_ai.pages, 1):
+            langs = [(dl.language_code, f"{dl.confidence:.2f}") for dl in p.detected_languages]
+            print(f"[PAGE {i}] detected_languages:", langs)
+        print("\n[OCR TEXT PREVIEW]\n", full[:400])
+
+    # ページサイズは画像から取得
+    img_doc = fitz.open(input_img)
+    W, H = img_doc[0].rect.width, img_doc[0].rect.height
+    img_doc.close()
+
+    # 出力PDF作成
+    dst = fitz.open()
+    page = dst.new_page(width=W, height=H)
+
+    # ★ PyMuPDF 1.26 方式：ページにフォントを登録（組み込みCJKフォント）
+    #   "japan" を指定すると CJK 対応フォールバックが埋め込まれ、日本語が確実に表示可能。
+    page.insert_font(fontname="japan")  # ← これがキモ！ :contentReference[oaicite:1]{index=1}
+    FONT_NAME = "japan"
+
+    # 背景に元画像
+    page.insert_image(fitz.Rect(0,0,W,H), filename=input_img)
+
+    # 透明テキスト（段落→行→トークン）
+    for dp in doc_ai.pages:
+        placed = False
+
+        if getattr(dp, "paragraphs", None):
+            for para in dp.paragraphs:
+                text = extract_text_from_anchor(para.layout.text_anchor, full).strip()
+                r = normalized_poly_to_rect(para.layout.bounding_poly.normalized_vertices, W, H)
+                if text and r:
+                    page.insert_textbox(r, text, fontsize=8, render_mode=3, fontname=FONT_NAME)
+                    placed = True
+
+        if not placed and getattr(dp, "lines", None):
+            for line in dp.lines:
+                text = extract_text_from_anchor(line.layout.text_anchor, full).strip()
+                r = normalized_poly_to_rect(line.layout.bounding_poly.normalized_vertices, W, H)
+                if text and r:
+                    page.insert_textbox(r, text, fontsize=8, render_mode=3, fontname=FONT_NAME)
+                    placed = True
+
+        if not placed and getattr(dp, "tokens", None):
+            for tok in dp.tokens:
+                text = extract_text_from_anchor(tok.layout.text_anchor, full).strip()
+                r = normalized_poly_to_rect(tok.layout.bounding_poly.normalized_vertices, W, H)
+                if text and r:
+                    page.insert_textbox(r, text, fontsize=6, render_mode=3, fontname=FONT_NAME)
+
+    # 保存（Windowsロックに強く）
+    tmp = output_pdf + ".tmp"
+    dst.save(tmp); dst.close()
+    if replace_with_retry(tmp, output_pdf):
+        print("\n[DONE] 検索可能PDFを作成:", output_pdf)
+    else:
+        print(f"[WARN] {output_pdf} を置換できませんでした。アプリを閉じてください。保持: {tmp}")
+
+if __name__ == "__main__":
+    image_to_searchable_pdf(INPUT_IMG, OUTPUT_PDF, print_langs=True)
