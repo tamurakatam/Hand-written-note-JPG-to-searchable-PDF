@@ -1,0 +1,248 @@
+# -*- coding: utf-8 -*-
+"""
+JPG → 検索可能PDF（短縮版・降順レンジ対応）
+- 全体OCR + 下帯ズーム再OCR 合成
+- 透明テキスト埋め込みで検索可能PDF作成
+"""
+
+import os, io, time
+from typing import Optional, Tuple
+import fitz
+from PIL import Image, ImageOps
+from google.cloud import documentai_v1 as documentai
+from google.api_core.client_options import ClientOptions
+from google.api_core.exceptions import PermissionDenied, InvalidArgument, GoogleAPICallError
+
+# ===================== 設定 =====================
+CONFIG = {
+    'base_dir': r"C:\Users\Koichi\OneDrive\Documents\jupyter\手書きノートJPG → 検索可能PDF",
+    'input_dir': r"JPG\マイナス",
+    'output_dir': r"PDF\マイナス",
+    'file_prefix': "p",
+    'batch_start': -37,     # ここを基準に双方向レンジで回す
+    'batch_end': -77,       # 例: -37 → -77 の降順でもOK
+    'credentials': r"GOOGLE_APPLICATION_CREDENTIALS\kinetic-horizon-427307-b9-b6a966b09ac0.json",
+    'project_id': "kinetic-horizon-427307-b9",
+    'location': "us",
+    'processor_id': "df6a2b825d9f887a",
+    'border_px': 60,
+    'padding_px': 1.5,
+    'bottom_ratio': 0.30,
+    'bottom_scale': 1.70,
+    'jpeg_quality': 85,
+    'sleep_sec': 0.8
+}
+
+# パス設定
+INPUT_DIR = os.path.join(CONFIG['base_dir'], CONFIG['input_dir'])
+OUTPUT_DIR = os.path.join(CONFIG['base_dir'], CONFIG['output_dir'])
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(CONFIG['base_dir'], CONFIG['credentials'])
+
+# Document AI クライアント
+client = documentai.DocumentProcessorServiceClient(
+    client_options=ClientOptions(api_endpoint=f"{CONFIG['location']}-documentai.googleapis.com")
+)
+PROCESSOR_NAME = client.processor_path(CONFIG['project_id'], CONFIG['location'], CONFIG['processor_id'])
+
+# ===================== ヘルパー関数 =====================
+def load_image(path: str) -> Tuple[bytes, int, int, Image.Image]:
+    """画像読み込み（EXIF正規化 + 白ボーダー付与）"""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"入力画像が見つかりません: {path}")
+    img = Image.open(path).convert("RGB")
+    img = ImageOps.exif_transpose(img)
+    if CONFIG['border_px'] > 0:
+        img = ImageOps.expand(img, border=CONFIG['border_px'], fill="white")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=95)
+    return buf.getvalue(), img.width, img.height, img
+
+def ocr_image(img_bytes: bytes) -> documentai.Document:
+    """Document AI でOCR実行"""
+    req = documentai.ProcessRequest(
+        name=PROCESSOR_NAME,
+        raw_document=documentai.RawDocument(content=img_bytes, mime_type="image/jpeg"),
+        process_options=documentai.ProcessOptions(
+            ocr_config=documentai.OcrConfig(
+                hints=documentai.OcrConfig.Hints(language_hints=["ja", "ja-JP", "en"]),
+                enable_image_quality_scores=True,
+                compute_style_info=True,
+            )
+        )
+    )
+    return client.process_document(request=req).document
+
+def get_text(anchor: Optional[documentai.Document.TextAnchor], full_text: str) -> str:
+    """テキストアンカーから文字列抽出"""
+    if not anchor or not getattr(anchor, "text_segments", None):
+        return ""
+    return "".join(
+        full_text[int(seg.start_index or 0):int(seg.end_index)]
+        for seg in anchor.text_segments
+    )
+
+def create_rect(norm_verts, w: float, h: float, pad: float = CONFIG['padding_px']) -> Optional[fitz.Rect]:
+    """正規化座標からfitz.Rect作成"""
+    if not norm_verts or len(norm_verts) < 3:
+        return None
+    xs = [v.x * w for v in norm_verts]
+    ys = [v.y * h for v in norm_verts]
+    x0, y0, x1, y1 = min(xs)-pad, min(ys)-pad, max(xs)+pad, max(ys)+pad
+    if x1 <= x0 or y1 <= y0:
+        return None
+    r = fitz.Rect(x0, y0, x1, y1)
+    # ページ内にクランプ
+    r = fitz.Rect(max(0, r.x0), max(0, r.y0), min(w, r.x1), min(h, r.y1))
+    return r if r.width > 0 and r.height > 0 else None
+
+def insert_text(page: fitz.Page, rect: Optional[fitz.Rect], text: str):
+    """透明テキスト挿入（render_mode=3）"""
+    if not text or not rect:
+        return
+    fontsize = max(4, min(12, rect.height * 0.9))
+    # フォントは環境依存を避けるため指定しない（デフォルト埋め込み）
+    page.insert_textbox(rect, text, fontsize=fontsize, render_mode=3)
+
+def save_pdf(doc: fitz.Document, out_path: str):
+    """PDF保存（linear対応差異吸収）"""
+    tmp = out_path + ".tmp"
+    try:
+        doc.save(tmp, garbage=4, deflate=True, clean=True, linear=True)
+    except Exception:
+        doc.save(tmp, garbage=4, deflate=True, clean=True)
+    finally:
+        doc.close()
+
+    # リトライ付き置換
+    for _ in range(5):
+        try:
+            os.replace(tmp, out_path)
+            print(f"\n[DONE] 検索可能PDF作成: {out_path}")
+            return
+        except PermissionError:
+            time.sleep(0.5)
+    print(f"[WARN] {out_path} を置換できませんでした。保持: {tmp}")
+
+def iter_batch(start: int, end: int):
+    """start <= end でも start > end でも end を含めつつ回す"""
+    step = 1 if start <= end else -1
+    return range(start, end + step, step)
+
+# ===================== メイン処理 =====================
+def process_image(input_path: str, output_path: str):
+    """JPG画像を検索可能PDFに変換"""
+    # 画像読み込み
+    img_bytes, W, H, pil_img = load_image(input_path)
+
+    # 全体OCR
+    doc_full = ocr_image(img_bytes)
+    full_text = (doc_full.text or "")
+    print(f"[全体OCR] {full_text[:200]}...")
+
+    # 下帯切り出し・拡大・再OCR
+    band_top = int(H * (1 - CONFIG['bottom_ratio']))
+    pil_band = pil_img.crop((0, band_top, W, H))
+    if CONFIG['bottom_scale'] != 1.0:
+        new_w = int(pil_band.width * CONFIG['bottom_scale'])
+        new_h = int(pil_band.height * CONFIG['bottom_scale'])
+        pil_band = pil_band.resize((new_w, new_h), Image.LANCZOS)
+
+    buf = io.BytesIO()
+    pil_band.save(buf, format="JPEG", quality=95)
+    band_bytes = buf.getvalue()
+    buf.close()
+
+    doc_band = ocr_image(band_bytes)
+    band_text = (doc_band.text or "")
+    print(f"[下帯OCR] {band_text[:100]}...")
+
+    # 拡大率計算（座標逆変換に使用）
+    scale_x = pil_band.width / W
+    scale_y = pil_band.height / (H - band_top if (H - band_top) != 0 else 1)
+
+    # PDF作成
+    pdf = fitz.open()
+    page = pdf.new_page(width=W, height=H)
+
+    # 背景画像挿入
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=CONFIG['jpeg_quality'], optimize=True, progressive=True)
+    page.insert_image(fitz.Rect(0, 0, W, H), stream=buf.getvalue())
+    buf.close()
+
+    # 全体OCRテキスト配置
+    for page_data in getattr(doc_full, "pages", []):
+        if hasattr(page_data, 'lines'):
+            for line in page_data.lines:
+                try:
+                    text = get_text(line.layout.text_anchor, full_text).strip()
+                    rect = create_rect(line.layout.bounding_poly.normalized_vertices, W, H)
+                    insert_text(page, rect, text)
+                except Exception:
+                    # 頑健性のため一行単位で握りつぶし
+                    pass
+
+    # 下帯OCRテキスト配置（座標変換）
+    def band_rect(norm_verts):
+        r = create_rect(norm_verts, pil_band.width, pil_band.height)
+        if not r:
+            return None
+        return fitz.Rect(
+            r.x0/scale_x, r.y0/scale_y + band_top,
+            r.x1/scale_x, r.y1/scale_y + band_top
+        )
+
+    for page_data in getattr(doc_band, "pages", []):
+        if hasattr(page_data, 'lines'):
+            for line in page_data.lines:
+                try:
+                    text = get_text(line.layout.text_anchor, band_text).strip()
+                    rect = band_rect(line.layout.bounding_poly.normalized_vertices)
+                    insert_text(page, rect, text)
+                except Exception:
+                    pass
+
+    save_pdf(pdf, output_path)
+
+# ===================== バッチ処理 =====================
+def batch_convert():
+    """指定範囲の画像を一括変換"""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    total = skipped = errors = 0
+    ran_once = False
+
+    for n in iter_batch(CONFIG['batch_start'], CONFIG['batch_end']):
+        ran_once = True
+        in_path = os.path.join(INPUT_DIR, f"{CONFIG['file_prefix']}{n}.jpg")
+        out_path = os.path.join(OUTPUT_DIR, f"{CONFIG['file_prefix']}{n}.pdf")
+
+        if not os.path.exists(in_path):
+            print(f"[SKIP] 入力ファイルなし: {in_path}")
+            skipped += 1
+            continue
+
+        print(f"\n[{n}] {os.path.basename(in_path)} → {os.path.basename(out_path)}")
+        try:
+            process_image(in_path, out_path)
+            total += 1
+        except (PermissionDenied, InvalidArgument, GoogleAPICallError) as ge:
+            errors += 1
+            print(f"[ERROR: GCP] {ge}")
+        except FileNotFoundError as fe:
+            errors += 1
+            print(f"[ERROR: FILE] {fe}")
+        except Exception as e:
+            errors += 1
+            print(f"[ERROR] 処理失敗: {e}")
+
+        if CONFIG['sleep_sec'] > 0:
+            time.sleep(CONFIG['sleep_sec'])
+
+    if not ran_once:
+        print("[WARN] ループ条件が空です。batch_start/batch_end の値を見直してください。")
+
+    print(f"\n=== 完了: 変換 {total} 件, スキップ {skipped} 件, エラー {errors} 件 ===")
+
+# ===================== 実行 =====================
+if __name__ == "__main__":
+    batch_convert()
