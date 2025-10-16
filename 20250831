@@ -1,72 +1,70 @@
 # -*- coding: utf-8 -*-
 """
-p1.jpg → 検索可能PDF（日本語OK / PyMuPDF 1.26 用）
-- Document AI で OCR（日本語ヒント）
-- フォントは Page.insert_font('japan') を使用（CJK対応フォールバックを自動埋め込み）
-- 透明テキスト: 段落 → 行 → トークンの順で配置（不可視 render_mode=3）
+JPG → 検索可能PDF（下端落ち対策：全体OCR + 下帯ズーム再OCR 合成 / 拡大率補正 + 軽量化）
+- 画像送信前に白ボーダー付与＋EXIF向き正規化
+- 1) 全体OCR（行）
+- 2) 下帯（既定: 下30%）を切り出し 1.7倍で再OCR → 拡大率で割り戻して座標合成
+- bboxは外接矩形＋パディング → ページ内クランプ
+- 背景画像は JPEG（progressive / optimize）でPDFへ埋め込み → ファイルサイズ削減
+- 透明テキスト render_mode=3 / CJKフォント "japan"
+- PyMuPDFのlinear化（Web最適化）は新バージョンで非対応 → 自動でfallback
 """
 
-import os, json, time
-from typing import List, Optional
+import os, io, time
+from typing import Optional, Tuple
+
 import fitz  # PyMuPDF
+from PIL import Image, ImageOps
+
 from google.cloud import documentai_v1 as documentai
 from google.api_core.client_options import ClientOptions
 from google.api_core.exceptions import PermissionDenied, InvalidArgument, GoogleAPICallError
 
-# ===== 認証 =====
-GOOGLE_APPLICATION_CREDENTIALS = r"C:\Users\Koichi\Downloads\kinetic-horizon-427307-b9-b6a966b09ac0.json"
+# ===================== 設定 =====================
+GOOGLE_APPLICATION_CREDENTIALS = r"C:\Users\Koichi\OneDrive\Documents\jupyter\手書きノートJPG → 検索可能PDF\GOOGLE_APPLICATION_CREDENTIALS\kinetic-horizon-427307-b9-b6a966b09ac0.json"
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GOOGLE_APPLICATION_CREDENTIALS
 
-# ===== 入出力 =====
-INPUT_IMG  = r"C:\Users\Koichi\Documents\p3.jpg"
-OUTPUT_PDF = r"C:\Users\Koichi\Documents\note_ocr.pdf"
+INPUT_IMG  = r"C:\Users\Koichi\OneDrive\Documents\jupyter\手書きノートJPG → 検索可能PDF\JPG\プラス\p10_1.jpg"
+OUTPUT_PDF = r"C:\Users\Koichi\OneDrive\Documents\jupyter\手書きノートJPG → 検索可能PDF\PDF\プラス\p10_1.pdf"
 
-# ===== Document AI =====
+# ※ PROJECT_ID は GCP の実プロジェクトID（例: "kinetic-horizon-427307"）
 PROJECT_ID   = "kinetic-horizon-427307-b9"
 LOCATION     = "us"
-PROCESSOR_ID = "df6a2b825d9f887a"       # 例: 'f7c1234567890abc'
+PROCESSOR_ID = "df6a2b825d9f887a"
 
+# 端ギリ・下端対策
+BORDER_PX   = 60      # 白フチ(px)
+PADDING_PX  = 1.5     # bboxパディング(px)
+BOTTOM_BAND_RATIO = 0.30  # 下30%を再OCR
+BOTTOM_SCALE      = 1.70  # 下帯拡大率
+
+# 軽量化オプション
+USE_TOKENS    = False      # Trueにすると行＋トークン配置（精密だが容量増）
+JPEG_QUALITY  = 85         # 80〜90 推奨（小さくするなら80、精細なら88〜90）
+JPEG_PROGRESSIVE = True
+JPEG_OPTIMIZE     = True
+
+# ===================== Document AI クライアント =====================
 client = documentai.DocumentProcessorServiceClient(
     client_options=ClientOptions(api_endpoint=f"{LOCATION}-documentai.googleapis.com")
 )
 PROCESSOR_NAME = client.processor_path(PROJECT_ID, LOCATION, PROCESSOR_ID)
 
-# ===== ヘルパー =====
-def extract_text_from_anchor(anchor: Optional[documentai.Document.TextAnchor], full_text: str) -> str:
-    if not anchor or not anchor.text_segments: return ""
-    parts = []
-    for seg in anchor.text_segments:
-        s = int(seg.start_index) if seg.start_index is not None else 0
-        e = int(seg.end_index)
-        parts.append(full_text[s:e])
-    return "".join(parts)
+# ===================== ヘルパー =====================
+def read_image_with_border(path: str, border: int) -> Tuple[bytes, int, int, Image.Image]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"入力画像が見つかりません: {path}")
+    img = Image.open(path)
+    img = ImageOps.exif_transpose(img)
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    if border > 0:
+        img = ImageOps.expand(img, border=border, fill="white")
+    buf = io.BytesIO(); img.save(buf, format="JPEG", quality=95)
+    data = buf.getvalue(); buf.close()
+    return data, img.width, img.height, img
 
-def normalized_poly_to_rect(norm_verts, w: float, h: float) -> Optional[fitz.Rect]:
-    if not norm_verts or len(norm_verts) < 3: return None
-    x0, y0 = norm_verts[0].x * w, norm_verts[0].y * h
-    x2, y2 = norm_verts[2].x * w, norm_verts[2].y * h
-    if x2 <= x0 or y2 <= y0: return None
-    return fitz.Rect(x0, y0, x2, y2)
-
-def replace_with_retry(src: str, dst: str, retries=5, delay=0.5) -> bool:
-    for _ in range(retries):
-        try:
-            os.replace(src, dst); return True
-        except PermissionError:
-            time.sleep(delay)
-    return False
-
-# ===== メイン =====
-def image_to_searchable_pdf(input_img: str, output_pdf: str, print_langs=True):
-    if "ここに_b9_の_ProcessorID" in PROCESSOR_ID:
-        raise RuntimeError("PROCESSOR_ID を実IDに置き換えてください。")
-    if not os.path.exists(input_img):
-        raise FileNotFoundError(f"入力画像が見つかりません: {input_img}")
-
-    with open(input_img, "rb") as f:
-        img_bytes = f.read()
-
-    # 日本語ヒント付き
+def ocr_bytes(img_bytes: bytes) -> documentai.Document:
     process_options = documentai.ProcessOptions(
         ocr_config=documentai.OcrConfig(
             hints=documentai.OcrConfig.Hints(language_hints=["ja","ja-JP","en"]),
@@ -74,14 +72,13 @@ def image_to_searchable_pdf(input_img: str, output_pdf: str, print_langs=True):
             compute_style_info=True,
         )
     )
-    request = documentai.ProcessRequest(
+    req = documentai.ProcessRequest(
         name=PROCESSOR_NAME,
         raw_document=documentai.RawDocument(content=img_bytes, mime_type="image/jpeg"),
         process_options=process_options,
     )
-
     try:
-        res = client.process_document(request=request)
+        return client.process_document(request=req).document
     except PermissionDenied:
         print("[ERROR] PermissionDenied 403 / 権限・課金・endpoint/location を確認"); raise
     except InvalidArgument:
@@ -89,65 +86,168 @@ def image_to_searchable_pdf(input_img: str, output_pdf: str, print_langs=True):
     except GoogleAPICallError as e:
         print("[ERROR] GoogleAPICallError:", e); raise
 
-    doc_ai = res.document
-    full = doc_ai.text or ""
+def extract_text(anchor: Optional[documentai.Document.TextAnchor], full_text: str) -> str:
+    if not anchor or not getattr(anchor, "text_segments", None): return ""
+    out = []
+    for seg in anchor.text_segments:
+        s = int(seg.start_index) if seg.start_index is not None else 0
+        e = int(seg.end_index); out.append(full_text[s:e])
+    return "".join(out)
+
+def rect_from_norm_verts(norm_verts, w: float, h: float, pad: float = PADDING_PX) -> Optional[fitz.Rect]:
+    if not norm_verts or len(norm_verts) < 3: return None
+    xs = [v.x * w for v in norm_verts]; ys = [v.y * h for v in norm_verts]
+    x0, y0, x1, y1 = min(xs)-pad, min(ys)-pad, max(xs)+pad, max(ys)+pad
+    if x1 <= x0 or y1 <= y0: return None
+    return fitz.Rect(x0, y0, x1, y1)
+
+def clamp_rect(r: fitz.Rect, W: float, H: float) -> Optional[fitz.Rect]:
+    rr = fitz.Rect(max(0, r.x0), max(0, r.y0), min(W, r.x1), min(H, r.y1))
+    if rr.width <= 0 or rr.height <= 0: return None
+    return rr
+
+def insert_box(page: fitz.Page, r: Optional[fitz.Rect], text: str, fontname: str, min_pt=4, max_pt=12):
+    if not text or r is None: return
+    fs = max(min_pt, min(max_pt, r.height * 0.9))
+    page.insert_textbox(r, text, fontsize=fs, render_mode=3, fontname=fontname)
+
+def replace_with_retry(src: str, dst: str, retries=5, delay=0.5) -> bool:
+    for _ in range(retries):
+        try: os.replace(src, dst); return True
+        except PermissionError: time.sleep(delay)
+    return False
+
+def save_pdf_smart(doc: fitz.Document, out_path: str):
+    """PyMuPDFのlinear対応差異を吸収して安全に保存する"""
+    tmp = out_path + ".tmp"
+    try:
+        # まずは従来オプション（古いPyMuPDF環境なら通る）
+        doc.save(tmp, garbage=4, deflate=True, clean=True, linear=True)
+    except Exception:
+        # 新しいPyMuPDFでは linear 非対応 → linear なしで再保存
+        doc.save(tmp, garbage=4, deflate=True, clean=True)
+    finally:
+        doc.close()
+    if replace_with_retry(tmp, out_path):
+        print("\n[DONE] 検索可能PDFを作成:", out_path)
+    else:
+        print(f"[WARN] {out_path} を置換できませんでした。アプリを閉じてください。保持: {tmp}")
+
+# ===================== メイン =====================
+def image_to_searchable_pdf(input_img: str, output_pdf: str, print_langs=True, debug=False):
+    # 画像（余白込み）
+    img_bytes, W, H, pil_full = read_image_with_border(input_img, BORDER_PX)
+
+    # --- 全体OCR ---
+    doc_full = ocr_bytes(img_bytes)
+    full_text = doc_full.text or ""
+
     if print_langs:
-        for i, p in enumerate(doc_ai.pages, 1):
+        for i, p in enumerate(doc_full.pages, 1):
             langs = [(dl.language_code, f"{dl.confidence:.2f}") for dl in p.detected_languages]
-            print(f"[PAGE {i}] detected_languages:", langs)
-        print("\n[OCR TEXT PREVIEW]\n", full[:400])
+            print(f"[FULL PAGE {i}] detected_languages:", langs)
+        print("\n[FULL OCR PREVIEW]\n", full_text[:400])
 
-    # ページサイズは画像から取得
-    img_doc = fitz.open(input_img)
-    W, H = img_doc[0].rect.width, img_doc[0].rect.height
-    img_doc.close()
+    # --- 下帯切り出し → 拡大 → 再OCR ---
+    band_top = int(H * (1.0 - BOTTOM_BAND_RATIO))
+    band_box = (0, band_top, W, H)
+    pil_band = pil_full.crop(band_box)
+    if BOTTOM_SCALE != 1.0:
+        pil_band = pil_band.resize(
+            (int(pil_band.width * BOTTOM_SCALE), int(pil_band.height * BOTTOM_SCALE)),
+            Image.LANCZOS
+        )
 
-    # 出力PDF作成
+    buf_band = io.BytesIO(); pil_band.save(buf_band, format="JPEG", quality=95)
+    band_bytes = buf_band.getvalue(); buf_band.close()
+
+    doc_band = ocr_bytes(band_bytes)
+    band_text = doc_band.text or ""
+
+    if print_langs:
+        for i, p in enumerate(doc_band.pages, 1):
+            langs = [(dl.language_code, f"{dl.confidence:.2f}") for dl in p.detected_languages]
+            print(f"[BOTTOM BAND {i}] detected_languages:", langs)
+        print("\n[BOTTOM OCR PREVIEW]\n", band_text[:200])
+
+    # 元サイズと拡大後サイズから拡大率を算出（安全のため X/Y 個別）
+    band_w_scaled, band_h_scaled = pil_band.width, pil_band.height
+    orig_band_h = H - band_top
+    orig_band_w = W
+    scale_x = band_w_scaled / float(orig_band_w)
+    scale_y = band_h_scaled / float(orig_band_h)
+
+    # --- PDF キャンバス ---
     dst = fitz.open()
     page = dst.new_page(width=W, height=H)
 
-    # ★ PyMuPDF 1.26 方式：ページにフォントを登録（組み込みCJKフォント）
-    #   "japan" を指定すると CJK 対応フォールバックが埋め込まれ、日本語が確実に表示可能。
-    page.insert_font(fontname="japan")  # ← これがキモ！ :contentReference[oaicite:1]{index=1}
+    # 背景画像は JPEG で軽量埋め込み（PNGより大幅に小さい）
+    buf_jpg = io.BytesIO()
+    pil_full.save(
+        buf_jpg,
+        format="JPEG",
+        quality=JPEG_QUALITY,
+        optimize=JPEG_OPTIMIZE,
+        progressive=JPEG_PROGRESSIVE,
+    )
+    page.insert_image(fitz.Rect(0, 0, W, H), stream=buf_jpg.getvalue())
+    buf_jpg.close()
+
+    # CJKフォント
+    page.insert_font(fontname="japan")
     FONT_NAME = "japan"
 
-    # 背景に元画像
-    page.insert_image(fitz.Rect(0,0,W,H), filename=input_img)
-
-    # 透明テキスト（段落→行→トークン）
-    for dp in doc_ai.pages:
-        placed = False
-
-        if getattr(dp, "paragraphs", None):
-            for para in dp.paragraphs:
-                text = extract_text_from_anchor(para.layout.text_anchor, full).strip()
-                r = normalized_poly_to_rect(para.layout.bounding_poly.normalized_vertices, W, H)
-                if text and r:
-                    page.insert_textbox(r, text, fontsize=8, render_mode=3, fontname=FONT_NAME)
-                    placed = True
-
-        if not placed and getattr(dp, "lines", None):
+    # --- 全体OCRの配置（既定：行のみ） ---
+    for dp in doc_full.pages:
+        if getattr(dp, "lines", None):
             for line in dp.lines:
-                text = extract_text_from_anchor(line.layout.text_anchor, full).strip()
-                r = normalized_poly_to_rect(line.layout.bounding_poly.normalized_vertices, W, H)
-                if text and r:
-                    page.insert_textbox(r, text, fontsize=8, render_mode=3, fontname=FONT_NAME)
-                    placed = True
+                text = extract_text(line.layout.text_anchor, full_text).strip()
+                r = rect_from_norm_verts(line.layout.bounding_poly.normalized_vertices, W, H, pad=PADDING_PX)
+                if r: r = clamp_rect(r, W, H)
+                insert_box(page, r, text, FONT_NAME)
 
-        if not placed and getattr(dp, "tokens", None):
+        if USE_TOKENS and getattr(dp, "tokens", None):
             for tok in dp.tokens:
-                text = extract_text_from_anchor(tok.layout.text_anchor, full).strip()
-                r = normalized_poly_to_rect(tok.layout.bounding_poly.normalized_vertices, W, H)
-                if text and r:
-                    page.insert_textbox(r, text, fontsize=6, render_mode=3, fontname=FONT_NAME)
+                text = extract_text(tok.layout.text_anchor, full_text).strip()
+                r = rect_from_norm_verts(tok.layout.bounding_poly.normalized_vertices, W, H, pad=0.5)
+                if r: r = clamp_rect(r, W, H)
+                insert_box(page, r, text, FONT_NAME)
 
-    # 保存（Windowsロックに強く）
-    tmp = output_pdf + ".tmp"
-    dst.save(tmp); dst.close()
-    if replace_with_retry(tmp, output_pdf):
-        print("\n[DONE] 検索可能PDFを作成:", output_pdf)
-    else:
-        print(f"[WARN] {output_pdf} を置換できませんでした。アプリを閉じてください。保持: {tmp}")
+    # --- 下帯OCRの配置（拡大率を割り戻してから band_top を加算） ---
+    def rect_from_band_norm(norm_verts) -> Optional[fitz.Rect]:
+        # まず拡大後バンドのpx座標で矩形
+        r_scaled = rect_from_norm_verts(norm_verts, band_w_scaled, band_h_scaled, pad=PADDING_PX)
+        if not r_scaled:
+            return None
+        # 拡大前（元の下帯）座標へ割り戻し
+        x0 = r_scaled.x0 / scale_x
+        y0 = r_scaled.y0 / scale_y
+        x1 = r_scaled.x1 / scale_x
+        y1 = r_scaled.y1 / scale_y
+        # 元ページへオフセット
+        r = fitz.Rect(x0, y0 + band_top, x1, y1 + band_top)
+        return clamp_rect(r, W, H)
 
+    for dp in doc_band.pages:
+        if getattr(dp, "lines", None):
+            for line in dp.lines:
+                text = extract_text(line.layout.text_anchor, band_text).strip()
+                r = rect_from_band_norm(line.layout.bounding_poly.normalized_vertices)
+                insert_box(page, r, text, FONT_NAME)
+
+        if USE_TOKENS and getattr(dp, "tokens", None):
+            for tok in dp.tokens:
+                text = extract_text(tok.layout.text_anchor, band_text).strip()
+                r = rect_from_band_norm(tok.layout.bounding_poly.normalized_vertices)
+                insert_box(page, r, text, FONT_NAME)
+
+    # デバッグ（任意）
+    if debug:
+        page.draw_rect(fitz.Rect(0, band_top, W, H), width=0.6)
+
+    # --- 保存（linearは非対応環境でも安全に） ---
+    save_pdf_smart(dst, output_pdf)
+
+# ===================== 実行 =====================
 if __name__ == "__main__":
-    image_to_searchable_pdf(INPUT_IMG, OUTPUT_PDF, print_langs=True)
+    image_to_searchable_pdf(INPUT_IMG, OUTPUT_PDF, print_langs=True, debug=False)
